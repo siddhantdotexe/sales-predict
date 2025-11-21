@@ -1,4 +1,4 @@
-# app.py — Big Mart Sales Predictor (Enhanced UI)
+# app.py — Big Mart Sales Predictor (Enhanced UI, fixed preprocessing/prediction)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -10,12 +10,12 @@ import plotly.graph_objects as go
 import streamlit.components.v1 as components
 
 # ------------------------
-# Asset path
+# Asset path (developer-provided)
 ASSET_URL = "/mnt/data/logs-siddhantdotexe-sales-predict-main-app.py-2025-11-20T15_47_54.591Z.txt"
 # ------------------------
 
 # ------------------------
-# Enhanced UI / Theme
+# Enhanced UI / Theme (unchanged)
 # ------------------------
 st.set_page_config(page_title="Big Mart Sales Predictor", page_icon="🛒", layout="wide")
 
@@ -210,7 +210,7 @@ def render_lottie(url, height=100):
 
 
 # ------------------------
-# Helpers
+# Helpers (improved correctness)
 # ------------------------
 def load_logo():
     for f in ("logo.png", "logo.jpg", "logo.jpeg"):
@@ -220,6 +220,10 @@ def load_logo():
 
 
 def load_model_and_data(model_path="model.pkl", x_path="X_data.pkl", csv_path="Train.csv"):
+    """
+    Load model (pickle), X_train metadata (pickled DataFrame) and full Train.csv (if present).
+    Returns (model, X_train, full_df) — any may be None with warnings shown later.
+    """
     model = None
     X_train = None
     full_df = None
@@ -229,21 +233,29 @@ def load_model_and_data(model_path="model.pkl", x_path="X_data.pkl", csv_path="T
             with open(model_path, "rb") as f:
                 model = pickle.load(f)
         except Exception as e:
-            st.warning(f"Could not load {model_path}: {e}")
+            # do not crash UI on bad pickle; show warning later
+            st.warning(f"Could not load '{model_path}': {e}")
 
     if os.path.exists(x_path):
         try:
             with open(x_path, "rb") as f:
                 X_train = pickle.load(f)
+            # ensure it's a DataFrame
+            if not isinstance(X_train, pd.DataFrame):
+                st.warning(f"X_data.pkl loaded but is not a pandas DataFrame. Ignoring X_data.pkl.")
+                X_train = None
         except Exception as e:
-            st.warning(f"Could not load {x_path}: {e}")
+            st.warning(f"Could not load '{x_path}': {e}")
+            X_train = None
 
     if os.path.exists(csv_path):
         try:
             full_df = pd.read_csv(csv_path)
         except Exception as e:
-            st.warning(f"Could not read {csv_path}: {e}")
+            st.warning(f"Could not read '{csv_path}': {e}")
+            full_df = None
 
+    # try common alternate pickles if Train.csv is not present
     if full_df is None:
         for alt in ("big_mart_data.pkl", "bigmart_full.pkl", "big_mart.pkl"):
             if os.path.exists(alt):
@@ -251,81 +263,120 @@ def load_model_and_data(model_path="model.pkl", x_path="X_data.pkl", csv_path="T
                     full_df = pd.read_pickle(alt)
                     break
                 except Exception:
-                    pass
+                    full_df = None
 
     return model, X_train, full_df
 
 
 def encode_input(df: pd.DataFrame, X_train: pd.DataFrame) -> pd.DataFrame:
+    """
+    Robust encoding that:
+    - Uses training data categories (if X_train provided) to map categorical columns to codes.
+    - Does NOT overwrite user-provided values with training-mode.
+    - Maps unseen categories -> -1 (distinct code).
+    - Adds missing columns expected by X_train with value 0.
+    - Reorders columns to match X_train.columns if provided.
+    """
     df = df.copy()
 
-    # Encode the basic categorical mappings
-    df.replace({"Item_Fat_Content": {"Low Fat": 0, "Regular": 1}}, inplace=True)
-    df.replace({"Outlet_Size": {"Small": 2, "Medium": 1, "High": 0}}, inplace=True)
-    df.replace({"Outlet_Location_Type": {"Tier 1": 0, "Tier 2": 1, "Tier 3": 2}}, inplace=True)
-    df.replace({"Outlet_Type": {
-        "Grocery Store": 0,
-        "Supermarket Type1": 1,
-        "Supermarket Type2": 2,
-        "Supermarket Type3": 3
-    }}, inplace=True)
+    # Ensure all expected columns exist (do not overwrite)
+    # Apply safe replacements for the columns that had consistent mapping in original notebook
+    # but only if present in df (do not force them)
+    if "Item_Fat_Content" in df.columns:
+        df["Item_Fat_Content"] = df["Item_Fat_Content"].replace({"Low Fat": 0, "Regular": 1})
+    if "Outlet_Size" in df.columns:
+        df["Outlet_Size"] = df["Outlet_Size"].replace({"Small": 2, "Medium": 1, "High": 0})
+    if "Outlet_Location_Type" in df.columns:
+        df["Outlet_Location_Type"] = df["Outlet_Location_Type"].replace({"Tier 1": 0, "Tier 2": 1, "Tier 3": 2})
+    if "Outlet_Type" in df.columns:
+        df["Outlet_Type"] = df["Outlet_Type"].replace({
+            "Grocery Store": 0,
+            "Supermarket Type1": 1,
+            "Supermarket Type2": 2,
+            "Supermarket Type3": 3
+        })
 
+    # If we have X_train metadata, use it to produce stable mappings for high-card categorical columns
     if X_train is not None:
-        # Handle categorical columns that need label encoding
-        categorical_cols = ['Item_Identifier', 'Item_Type', 'Outlet_Identifier']
+        # We'll handle columns that commonly existed in training
+        cat_candidates = [c for c in ["Item_Identifier", "Item_Type", "Outlet_Identifier"] if c in X_train.columns]
 
-        for col in categorical_cols:
+        for col in cat_candidates:
+            # Get training values (preserve order, unique)
+            train_vals = X_train[col].astype(object).tolist()
+            # We want unique preserving first-occurrence order
+            seen = {}
+            ordered_unique = []
+            for v in train_vals:
+                if v not in seen:
+                    seen[v] = True
+                    ordered_unique.append(v)
+
+            # Build mapping: value -> code (0..n-1)
+            mapping = {val: idx for idx, val in enumerate(ordered_unique)}
+
+            # If user provided the column, map values; unseen -> -1
             if col in df.columns:
-                if col in X_train.columns:
-                    # Get unique values from training data
-                    unique_train_values = X_train[col].unique() if X_train[col].dtype == 'object' else None
-
-                    if unique_train_values is not None:
-                        # Create a mapping from training data
-                        value_to_code = {val: idx for idx, val in enumerate(unique_train_values)}
-                        # Map the input value, use -1 for unseen categories
-                        df[col] = df[col].map(value_to_code).fillna(-1).astype(int)
-                    else:
-                        # If training data is already encoded, use mode
-                        df[col] = X_train[col].mode()[0] if len(X_train[col].mode()) > 0 else 0
+                # If df[col] is numeric already and training values are numeric, attempt direct usage
+                if pd.api.types.is_numeric_dtype(df[col]) and all(pd.api.types.is_number(x) for x in ordered_unique):
+                    # assume it's already encoded compatibly; attempt no-op
+                    # but cast to numeric to be safe
+                    df[col] = pd.to_numeric(df[col], errors="coerce").fillna(-1).astype(int)
                 else:
-                    # Column not in training data, drop it
-                    df.drop(columns=[col], inplace=True)
+                    # map strings/categories into codes; unseen -> -1
+                    df[col] = df[col].map(lambda x: mapping.get(x, -1)).astype(int)
+            else:
+                # Column not provided by user; do not force overwrite — add default -1 (unknown)
+                df[col] = -1
 
-        # Add missing columns from training data with default values
+        # Ensure all training columns exist in df; add missing numeric columns with 0
         for col in X_train.columns:
             if col not in df.columns:
-                df[col] = 0
+                # if training col is numeric, fill 0; else fill -1 for categorical
+                if pd.api.types.is_numeric_dtype(X_train[col]):
+                    df[col] = 0
+                else:
+                    df[col] = -1
 
-        # Ensure column order matches training data
-        df = df[X_train.columns]
+        # Reorder columns to match X_train exactly (important for model.predict)
+        df = df.reindex(columns=X_train.columns, fill_value=0)
     else:
-        # If no X_train provided, use simple label encoding
+        # No X_train available: do a minimal safe encoding for candidate categorical columns
         from sklearn.preprocessing import LabelEncoder
-        categorical_cols = ['Item_Identifier', 'Item_Type', 'Outlet_Identifier']
+        cat_candidates = [c for c in ["Item_Identifier", "Item_Type", "Outlet_Identifier"] if c in df.columns]
+        for col in cat_candidates:
+            if df[col].dtype == object:
+                try:
+                    le = LabelEncoder()
+                    df[col] = le.fit_transform(df[col].astype(str))
+                except Exception:
+                    # fallback to mapping by unique
+                    uniques = df[col].astype(str).unique().tolist()
+                    mapping = {v: i for i, v in enumerate(uniques)}
+                    df[col] = df[col].map(lambda x: mapping.get(str(x), -1)).astype(int)
 
-        for col in categorical_cols:
-            if col in df.columns and df[col].dtype == 'object':
-                le = LabelEncoder()
-                df[col] = le.fit_transform(df[col].astype(str))
-
-    # Ensure all columns are numeric
+    # Final safety: ensure all columns are numeric to avoid unpicklable dtypes in model
     for col in df.columns:
-        if df[col].dtype == 'object':
-            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+        if not pd.api.types.is_numeric_dtype(df[col]):
+            df[col] = pd.to_numeric(df[col].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
 
     return df
 
 
+def to_download_bytes(df: pd.DataFrame):
+    return df.to_csv(index=False).encode()
+
+
 # ------------------------
-# Load assets
+# Load assets (unchanged)
 # ------------------------
 logo_path = load_logo()
 with st.spinner("🔄 Loading model & data..."):
     model, X_train, full_df = load_model_and_data()
 
+
 # ------------------------
-# Sidebar
+# Sidebar (unchanged)
 # ------------------------
 with st.sidebar:
     st.markdown('<div style="text-align: center; margin-bottom: 24px;">', unsafe_allow_html=True)
@@ -357,8 +408,9 @@ with st.sidebar:
         f'<div style="text-align: center;"><a class="pill" href="{ASSET_URL}" target="_blank">📄 View Asset</a></div>',
         unsafe_allow_html=True)
 
+
 # ------------------------
-# Header
+# Header (unchanged)
 # ------------------------
 col1, col2 = st.columns([4, 1])
 with col1:
@@ -377,8 +429,9 @@ with col2:
 
 st.markdown("<br>", unsafe_allow_html=True)
 
+
 # ------------------------
-# SINGLE PREDICTION
+# SINGLE PREDICTION (unchanged UI, improved backend)
 # ------------------------
 if "🔮 Single Prediction" in page:
     st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -443,6 +496,12 @@ if "🔮 Single Prediction" in page:
         else:
             try:
                 enc = encode_input(raw, X_train)
+
+                # Check shape consistency before predicting
+                if enc.shape[1] != X_train.shape[1]:
+                    st.warning(f"Encoded input has {enc.shape[1]} cols but model expects {X_train.shape[1]}. Attempting to align...")
+                    enc = enc.reindex(columns=X_train.columns, fill_value=0)
+
                 pred = model.predict(enc)[0]
 
                 # Success display
@@ -474,8 +533,9 @@ if "🔮 Single Prediction" in page:
             except Exception as e:
                 st.error(f"❌ Prediction error: {e}")
 
+
 # ------------------------
-# ANALYTICS
+# ANALYTICS (unchanged UI, same visuals)
 # ------------------------
 elif "📊 Analytics" in page:
     st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -633,7 +693,7 @@ elif "📊 Analytics" in page:
 
                     fig_fi = px.bar(fi, x="importance", y="feature", orientation="h",
                                     color="importance",
-                                    color_continuous_scale=[[0, PRIMARY], [1, ACCENT]])
+                                    color_continuous_scale=[[0, PRIMARY], [1, SECONDARY]])
                     fig_fi.update_layout(
                         title=dict(
                             text="Top 20 Most Important Features",
@@ -667,8 +727,9 @@ elif "📊 Analytics" in page:
             except Exception as e:
                 st.error(f"❌ Could not compute feature importance: {e}")
 
+
 # ------------------------
-# ABOUT
+# ABOUT (unchanged)
 # ------------------------
 elif "ℹ️ About" in page:
     st.markdown('<div class="card">', unsafe_allow_html=True)
