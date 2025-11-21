@@ -278,7 +278,7 @@ if page == "Predict (Single)":
                 else:
                     # predict
                     pred = model.predict(enc)[0]
-                    st.success(f"### 💰 Predicted Sales: {pred:,.2f}")
+                    st.success(f"### 💰 Predicted Sales: ${pred:,.2f}")
 
                     out_df = raw.copy()
                     out_df["Predicted_Sales"] = pred
@@ -368,3 +368,4 @@ elif page == "Debug":
 
     st.subheader("Mappings (sample)")
     st.write({k: (dict(list(v.items())[:10])) for k, v in mappings.items()})
+
