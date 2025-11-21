@@ -1,371 +1,360 @@
-# app.py
+# app.py - Universal Sales Predictor (No server-side save; improved UI)
 import streamlit as st
 import pandas as pd
 import numpy as np
-import pickle
-import os
+import joblib
+from io import BytesIO
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import Ridge
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 import plotly.express as px
-import plotly.graph_objects as go
 import streamlit.components.v1 as components
-from collections import Counter
-from sklearn.preprocessing import LabelEncoder
 
-# ---------------------------
-# Helpers
-# ---------------------------
-def load_logo():
-    for f in ("logo.png", "logo.jpg", "logo.jpeg"):
-        if os.path.exists(f):
-            return f
-    return None
+# Optional XGBoost
+try:
+    from xgboost import XGBRegressor
+    XGBOOST_AVAILABLE = True
+except Exception:
+    XGBOOST_AVAILABLE = False
 
-def load_model_and_data(model_path="model.pkl", x_path="X_data.pkl", csv_path="Train.csv"):
-    model = None
-    X_train = None
-    raw_df = None
+# -----------------------
+# ASSET: uploaded file path (dev note: this will be transformed by infra)
+# -----------------------
+ASSET_URL = "/mnt/data/logs-siddhantdotexe-sales-predict-main-app.py-2025-11-20T15_47_54.591Z.txt"
 
-    if os.path.exists(model_path):
-        try:
-            with open(model_path, "rb") as f:
-                model = pickle.load(f)
-        except Exception as e:
-            st.warning(f"Failed to load model.pkl: {e}")
+# -----------------------
+# Page / theme tweaks
+# -----------------------
+st.set_page_config(page_title="Universal Sales Predictor", page_icon="🛒", layout="wide")
+primary = "#0f766e"   # teal
+accent = "#0369a1"    # blue
 
-    if os.path.exists(x_path):
-        try:
-            with open(x_path, "rb") as f:
-                X_train = pickle.load(f)
-        except Exception as e:
-            st.warning(f"Failed to load X_data.pkl: {e}")
+# small CSS for aesthetics
+st.markdown(
+    f"""
+    <style>
+    .main-card {{
+        background: linear-gradient(135deg, rgba(15,118,110,0.08), rgba(3,105,161,0.04));
+        border-radius: 14px;
+        padding: 18px;
+        box-shadow: 0 6px 24px rgba(16,24,40,0.06);
+    }}
+    .header-title {{
+        font-size:28px;
+        font-weight:700;
+        color: {primary};
+        margin: 0;
+    }}
+    .muted {{
+        color: #6b7280;
+    }}
+    .pill {{
+        display:inline-block;padding:6px 12px;border-radius:999px;background:#eef2ff;color:#3730a3;font-weight:600;font-size:12px;
+    }}
+    </style>
+    """, unsafe_allow_html=True
+)
 
-    if os.path.exists(csv_path):
-        try:
-            raw_df = pd.read_csv(csv_path)
-        except Exception as e:
-            st.warning(f"Failed to read Train.csv: {e}")
-
-    return model, X_train, raw_df
-
-# Build mapping between raw categorical values and numeric encodings
-def build_mappings(raw_df: pd.DataFrame, X_train: pd.DataFrame):
-    """
-    Returns dict: {col_name: {raw_value: encoded_value, ...}, ...}
-    Two modes:
-    - if X_train is provided (preferred): use row-wise relationships to infer mapping
-    - else: fit LabelEncoder on raw_df[col] and produce mapping raw->label
-    """
-    mappings = {}
-    if raw_df is None:
-        return mappings
-
-    # define categorical columns we expect from raw (based on your Train.csv)
-    cat_cols = [
-        "Item_Identifier", "Item_Fat_Content", "Item_Type",
-        "Outlet_Identifier", "Outlet_Size", "Outlet_Location_Type", "Outlet_Type"
-    ]
-
-    # normalize fat content variations
-    if "Item_Fat_Content" in raw_df.columns:
-        raw_df["Item_Fat_Content"] = raw_df["Item_Fat_Content"].replace({
-            "LF": "Low Fat",
-            "low fat": "Low Fat",
-            "lowfat": "Low Fat",
-            "reg": "Regular"
-        })
-
-    if X_train is not None:
-        # prefer using X_train to infer raw->encoded relationships
-        # align lengths if possible
-        if len(raw_df) == len(X_train):
-            for col in cat_cols:
-                if col in raw_df.columns and col in X_train.columns:
-                    # create a DataFrame with raw and encoded side-by-side
-                    temp = pd.DataFrame({
-                        "raw": raw_df[col].astype(str),
-                        "enc": X_train[col]
-                    })
-                    # For each raw value, pick the most common encoded value
-                    grp = temp.groupby("raw")["enc"].agg(lambda s: Counter(s).most_common(1)[0][0])
-                    mappings[col] = grp.to_dict()
-        else:
-            # fallback: try to map by unique value order (less robust but may work)
-            for col in cat_cols:
-                if col in raw_df.columns and col in X_train.columns:
-                    raw_unique = list(pd.Series(raw_df[col].astype(str).unique()))
-                    enc_unique = list(pd.Series(X_train[col].unique()))
-                    # if lengths mismatch, use mode-based mapping below instead
-                    if len(raw_unique) == len(enc_unique):
-                        mappings[col] = dict(zip(raw_unique, enc_unique))
-
-    # For any columns still unmapped, fit a LabelEncoder on raw_df
-    for col in cat_cols:
-        if col in raw_df.columns and col not in mappings:
-            le = LabelEncoder()
-            arr = raw_df[col].astype(str).values
-            le.fit(arr)
-            mapping = {val: int(le.transform([val])[0]) for val in le.classes_}
-            mappings[col] = mapping
-
-    return mappings
-
-def encode_input_single(raw_row: pd.DataFrame, mappings: dict, X_train: pd.DataFrame = None):
-    """
-    raw_row: single-row DataFrame with raw user inputs (string values)
-    mappings: dict produced by build_mappings
-    X_train: if provided, used to ensure final columns and column order
-    """
-    df = raw_row.copy()
-
-    # normalize Item_Fat_Content common variants
-    if "Item_Fat_Content" in df.columns:
-        df["Item_Fat_Content"] = df["Item_Fat_Content"].replace({
-            "LF": "Low Fat",
-            "low fat": "Low Fat",
-            "lowfat": "Low Fat",
-            "reg": "Regular"
-        })
-
-    # Apply categorical mappings
-    for col, mapping in mappings.items():
-        if col in df.columns:
-            raw_val = str(df.at[0, col])
-            if raw_val in mapping:
-                df.at[0, col] = mapping[raw_val]
-            else:
-                # fallback to most common mapping (mode) if unseen
-                # pick the encoded value that occurs most across mapping values
-                most_common_enc = Counter(mapping.values()).most_common(1)[0][0]
-                df.at[0, col] = most_common_enc
-        else:
-            # column missing in input: use the most common encoded value as fallback
-            most_common_enc = Counter(mapping.values()).most_common(1)[0][0]
-            df.at[0, col] = most_common_enc
-
-    # Ensure we have every column X_train had (if available)
-    if X_train is not None:
-        for col in X_train.columns:
-            if col not in df.columns:
-                df[col] = 0
-
-        # reorder to match training order
-        df = df[X_train.columns]
-    else:
-        # ensure numeric dtypes where possible
-        for c in df.columns:
-            try:
-                df[c] = pd.to_numeric(df[c])
-            except Exception:
-                pass
-
-    # final check: convert numeric-like columns to numeric
-    for c in df.columns:
-        if df[c].dtype == object:
-            # try safe conversion
-            try:
-                df[c] = pd.to_numeric(df[c])
-            except Exception:
-                # leave as-is (shouldn't happen for categorical cols because we mapped them)
-                pass
-
-    return df
-
-def save_predictions_local(df: pd.DataFrame, filename="predictions_saved.csv"):
-    mode = "a" if os.path.exists(filename) else "w"
-    df.to_csv(filename, mode=mode, header=not os.path.exists(filename), index=False)
-    return filename
-
-def render_lottie_from_url(url: str, height: int = 300):
-    html = f"""
-    <script src="https://unpkg.com/@lottiefiles/lottie-player@latest/dist/lottie-player.js"></script>
-    <lottie-player src="{url}" background="transparent" speed="1"
-    style="width:100%; height:{height}px;" loop autoplay></lottie-player>
-    """
-    components.html(html, height=height + 20)
-
-# ---------------------------
-# Load assets
-# ---------------------------
-st.set_page_config(page_title="Big Mart Sales Prediction", page_icon="🛒", layout="wide")
-logo_path = load_logo()
-
-with st.spinner("Loading model and metadata..."):
-    model, X_train, raw_df = load_model_and_data()
-
-# Build mappings (string -> encoded integer)
-mappings = build_mappings(raw_df, X_train)
-
-# ---------------------------
-# Sidebar
-# ---------------------------
-with st.sidebar:
-    if logo_path:
-        st.image(logo_path, width=160)
-    else:
-        st.markdown("### 🛒 Big Mart Dashboard")
-
-    page = st.radio("Navigation", ["Predict (Single)", "Analytics", "About & Save", "Debug"])
-    st.markdown("---")
-
-# ---------------------------
 # Header
-# ---------------------------
-col1, col2 = st.columns([3, 1])
-with col1:
-    st.title("🛒 Big Mart Sales Prediction — Dashboard")
-with col2:
+with st.container():
+    c1, c2 = st.columns([4,1])
+    with c1:
+        st.markdown('<div class="main-card">', unsafe_allow_html=True)
+        st.markdown('<div style="display:flex;align-items:center;gap:14px;">', unsafe_allow_html=True)
+        st.markdown(f'<div><h1 class="header-title">🛒 Universal Sales Predictor</h1><div class="muted">Upload any sales dataset, train quickly, and predict — downloads only (no server saves).</div></div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+    with c2:
+        # show the uploaded file link (developer: path will be converted to URL)
+        try:
+            # if it is an image the platform will serve; otherwise show as link
+            st.markdown(f'<a class="pill" href="{ASSET_URL}" target="_blank">View uploaded asset</a>', unsafe_allow_html=True)
+        except Exception:
+            pass
+
+st.write("")  # spacing
+
+# -------------------------
+# helper functions
+# -------------------------
+def rmse(y_true, y_pred):
+    return np.sqrt(mean_squared_error(y_true, y_pred))
+
+def build_preprocessor(df, feature_cols):
+    numeric_cols = [c for c in feature_cols if pd.api.types.is_numeric_dtype(df[c])]
+    cat_cols = [c for c in feature_cols if not pd.api.types.is_numeric_dtype(df[c])]
+
+    numeric_transformer = Pipeline([
+        ("imputer", SimpleImputer(strategy="mean")),
+        ("scaler", StandardScaler())
+    ])
+
+    # scikit-learn >=1.2 uses sparse_output
     try:
-        render_lottie_from_url("https://assets7.lottiefiles.com/packages/lf20_jbrw3hcz.json", height=120)
-    except:
-        pass
+        ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+    except TypeError:
+        ohe = OneHotEncoder(handle_unknown="ignore", sparse=False)
 
-# ---------------------------
-# PREDICT (SINGLE)
-# ---------------------------
-if page == "Predict (Single)":
-    st.header("🔮 Single Prediction")
+    categorical_transformer = Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("ohe", ohe)
+    ])
 
-    with st.form("single_form"):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            Item_Identifier = st.text_input("Item Identifier", "FDG33")
-            Item_Weight = st.number_input("Item Weight", 0.0, 200.0, 10.0)
-            Item_Fat_Content = st.selectbox("Item Fat Content", ["Low Fat", "Regular"])
+    preprocessor = ColumnTransformer([
+        ("num", numeric_transformer, numeric_cols),
+        ("cat", categorical_transformer, cat_cols)
+    ], remainder="drop", sparse_threshold=0)
 
-        with c2:
-            Item_Visibility = st.number_input("Item Visibility", 0.0, 1.0, 0.05, format="%.5f")
-            Item_Type = st.text_input("Item Type", "Seafood")
-            Item_MRP = st.number_input("Item MRP", 0.0, 10000.0, 200.0)
+    return preprocessor, numeric_cols, cat_cols
 
-        with c3:
-            Outlet_Identifier = st.text_input("Outlet Identifier", "OUT027")
-            Outlet_Establishment_Year = st.number_input("Outlet Year", 1900, 2030, 1990)
-            Outlet_Size = st.selectbox("Outlet Size", ["Small", "Medium", "High"])
-            Outlet_Location_Type = st.selectbox("Outlet Location", ["Tier 1", "Tier 2", "Tier 3"])
-            Outlet_Type = st.selectbox("Outlet Type", [
-                "Grocery Store", "Supermarket Type1", "Supermarket Type2", "Supermarket Type3"
-            ])
+def train_model(pipeline, X_train, y_train, X_val=None, y_val=None):
+    pipeline.fit(X_train, y_train)
+    train_preds = pipeline.predict(X_train)
+    stats = {
+        "r2_train": r2_score(y_train, train_preds),
+        "rmse_train": rmse(y_train, train_preds),
+        "mae_train": mean_absolute_error(y_train, train_preds)
+    }
+    if X_val is not None and y_val is not None:
+        val_preds = pipeline.predict(X_val)
+        stats.update({
+            "r2_val": r2_score(y_val, val_preds),
+            "rmse_val": rmse(y_val, val_preds),
+            "mae_val": mean_absolute_error(y_val, val_preds)
+        })
+    return pipeline, stats
 
-        submit = st.form_submit_button("Predict")
+def make_download_button_bytes(obj_bytes: bytes, filename: str, label: str):
+    return st.download_button(label=label, data=obj_bytes, file_name=filename, mime="application/octet-stream")
 
-    if submit:
-        raw = pd.DataFrame([{
-            "Item_Identifier": Item_Identifier,
-            "Item_Weight": Item_Weight,
-            "Item_Fat_Content": Item_Fat_Content,
-            "Item_Visibility": Item_Visibility,
-            "Item_Type": Item_Type,
-            "Item_MRP": Item_MRP,
-            "Outlet_Identifier": Outlet_Identifier,
-            "Outlet_Establishment_Year": Outlet_Establishment_Year,
-            "Outlet_Size": Outlet_Size,
-            "Outlet_Location_Type": Outlet_Location_Type,
-            "Outlet_Type": Outlet_Type
-        }])
+# -------------------------
+# Data upload / sample
+# -------------------------
+st.sidebar.header("Data & Model")
+uploaded_file = st.sidebar.file_uploader("Upload CSV dataset", type=["csv"], help="CSV with numeric target (sales).")
+use_sample = st.sidebar.checkbox("Use sample dataset (toy)", value=False)
 
-        st.subheader("Input (Preview)")
-        st.dataframe(raw.T)
+if use_sample:
+    df = px.data.tips().rename(columns={"total_bill":"Item_MRP", "tip":"Item_Outlet_Sales"})
+    df["Outlet_Type"] = np.random.choice(["Supermarket Type1","Grocery Store","Supermarket Type2"], size=len(df))
+    st.sidebar.success("Sample dataset loaded")
+elif uploaded_file is not None:
+    try:
+        df = pd.read_csv(uploaded_file)
+        # clear any previous pipeline if dataset changes
+        if "pipeline" in st.session_state:
+            del st.session_state["pipeline"]
+            st.sidebar.info("Previous model cleared — please retrain for this dataset.")
+    except Exception as e:
+        st.error(f"Could not read uploaded CSV: {e}")
+        st.stop()
+else:
+    st.info("Upload a CSV to start or toggle 'Use sample dataset' in the sidebar.")
+    st.stop()
 
-        if model is None:
-            st.error("Model (model.pkl) is missing or failed to load.")
+# main two-column layout: left for train/predict, right for analytics
+left, right = st.columns([2,1])
+
+# -------------------------
+# Left: Training + Prediction
+# -------------------------
+with left:
+    st.subheader("1) Configure dataset & train")
+    st.markdown("**Preview**")
+    st.dataframe(df.head())
+
+    st.markdown("**Choose target column (numeric)**")
+    target_col = st.selectbox("Target column", options=df.columns.tolist(), index=len(df.columns)-1)
+
+    if not pd.api.types.is_numeric_dtype(df[target_col]):
+        st.warning("Target column is not numeric. We will attempt to coerce to numeric (bad rows -> NaN).")
+        try:
+            df[target_col] = pd.to_numeric(df[target_col], errors="coerce")
+            if df[target_col].isna().all():
+                st.error("Target conversion failed — supply a numeric target column.")
+                st.stop()
+            else:
+                st.info("Target coerced to numeric, NaNs introduced for non-numeric rows.")
+        except Exception:
+            st.stop()
+
+    st.markdown("**Features (predictors)**")
+    default_features = [c for c in df.columns if c != target_col]
+    # remove accidental duplication
+    if target_col in default_features:
+        default_features.remove(target_col)
+
+    feature_cols = st.multiselect("Select features", options=default_features, default=default_features)
+
+    if len(feature_cols) == 0:
+        st.error("Pick at least one feature.")
+        st.stop()
+
+    drop_na_target = st.checkbox("Drop rows with missing target", value=True)
+    if drop_na_target:
+        df = df.dropna(subset=[target_col])
+
+    st.markdown("**Train / validation split**")
+    test_size = st.slider("Validation fraction", 0.05, 0.5, 0.2, step=0.05)
+
+    st.markdown("**Model selection**")
+    model_choice = st.selectbox("Regressor", options=["XGBoost (if available)" if XGBOOST_AVAILABLE else "XGBoost (unavailable)", "RandomForest", "Ridge (linear)"])
+    n_estimators = st.number_input("n_estimators (trees)", 50, 1000, value=100, step=10)
+
+    train_button = st.button("Train model", key="train_btn")
+    if train_button:
+        X = df[feature_cols]
+        y = df[target_col]
+        X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=test_size, random_state=42)
+
+        preprocessor, num_cols, cat_cols = build_preprocessor(df, feature_cols)
+
+        if "XGBoost" in model_choice and XGBOOST_AVAILABLE:
+            reg = XGBRegressor(n_estimators=int(n_estimators), verbosity=0, n_jobs=-1, random_state=42)
+        elif "RandomForest" in model_choice:
+            reg = RandomForestRegressor(n_estimators=int(n_estimators), n_jobs=-1, random_state=42)
         else:
-            try:
-                enc = encode_input_single(raw, mappings, X_train)
+            reg = Ridge()
 
-                # Validate dtypes are numeric
-                bad_cols = [c for c in enc.columns if enc[c].dtype == object]
-                if bad_cols:
-                    st.error(f"Encoding failed: columns still object dtype: {bad_cols}")
+        pipeline = Pipeline([
+            ("preprocessor", preprocessor),
+            ("regressor", reg)
+        ])
+
+        with st.spinner("Training..."):
+            pipeline, stats = train_model(pipeline, X_train, y_train, X_val, y_val)
+
+        st.success("Model trained")
+        # store pipeline in session so user can predict
+        st.session_state["pipeline"] = pipeline
+        st.session_state["feature_cols"] = feature_cols
+        st.session_state["target_col"] = target_col
+        st.session_state["model_stats"] = stats
+
+        # show metrics as cards
+        cols = st.columns(3)
+        cols[0].metric("Train R²", f"{stats['r2_train']:.4f}")
+        cols[1].metric("Val R²", f"{stats.get('r2_val', 'N/A') if stats.get('r2_val') is not None else 'N/A'}")
+        cols[2].metric("Val RMSE", f"{stats.get('rmse_val', 0):,.2f}")
+
+        # provide pipeline download (no server write)
+        buf = BytesIO()
+        joblib.dump(pipeline, buf)
+        buf.seek(0)
+        make_download_button_bytes(buf.read(), "pipeline.joblib", "⬇️ Download pipeline (joblib)")
+
+    # Prediction UI (single row)
+    if "pipeline" in st.session_state:
+        st.markdown("---")
+        st.subheader("2) Single-row prediction")
+        pipeline = st.session_state["pipeline"]
+        feat_cols = st.session_state["feature_cols"]
+
+        # use a sample row to provide sensible defaults
+        try:
+            example_row = df[feat_cols].dropna().sample(1, random_state=42).iloc[0]
+        except Exception:
+            example_row = None
+
+        single_inputs = {}
+        cols_input = st.columns(3)
+        for i, feat in enumerate(feat_cols):
+            with cols_input[i % 3]:
+                if pd.api.types.is_numeric_dtype(df[feat]):
+                    default = float(example_row[feat]) if example_row is not None else float(df[feat].dropna().median())
+                    single_inputs[feat] = st.number_input(feat, value=default)
                 else:
-                    # predict
-                    pred = model.predict(enc)[0]
-                    st.success(f"### 💰 Predicted Sales: ${pred:,.2f}")
+                    opts = df[feat].dropna().unique().tolist()
+                    default_idx = 0
+                    if example_row is not None:
+                        try:
+                            default_idx = list(opts).index(example_row[feat])
+                        except Exception:
+                            default_idx = 0
+                    single_inputs[feat] = st.selectbox(feat, options=opts, index=default_idx)
 
-                    out_df = raw.copy()
-                    out_df["Predicted_Sales"] = pred
+        if st.button("Predict single row"):
+            single_df = pd.DataFrame([single_inputs])
+            try:
+                pred = pipeline.predict(single_df)[0]
+                st.success(f"Predicted {st.session_state['target_col']}: {pred:,.2f}")
 
-                    st.download_button(
-                        "Download Prediction CSV",
-                        out_df.to_csv(index=False).encode(),
-                        "single_prediction.csv",
-                        "text/csv"
-                    )
-
-                    if st.button("Save Prediction"):
-                        save_predictions_local(out_df)
-                        st.success("Saved to predictions_saved.csv")
+                # show encoded vector (debug / transparency)
+                preproc = pipeline.named_steps.get("preprocessor", None)
+                if preproc is not None:
+                    try:
+                        encoded = preproc.transform(single_df)
+                        st.caption("Encoded input vector (first 10 values shown):")
+                        st.write(np.array(encoded).ravel()[:10].tolist())
+                    except Exception:
+                        pass
             except Exception as e:
                 st.error(f"Prediction failed: {e}")
 
-# ---------------------------
-# ANALYTICS
-# ---------------------------
-elif page == "Analytics":
-    st.header("📊 Analytics")
+        # Batch predictions (download only)
+        st.markdown("---")
+        st.subheader("Batch predictions (upload CSV with same feature columns)")
+        batch_upload = st.file_uploader("Upload CSV for batch prediction", type=["csv"], key="batch_pred")
+        if batch_upload is not None:
+            try:
+                batch_df = pd.read_csv(batch_upload)
+                missing = [c for c in feat_cols if c not in batch_df.columns]
+                if missing:
+                    st.error(f"Uploaded file missing required features: {missing}")
+                else:
+                    X_batch = batch_df[feat_cols]
+                    preds = pipeline.predict(X_batch)
+                    batch_df["Predicted_" + st.session_state["target_col"]] = preds
+                    st.dataframe(batch_df.head(20))
+                    csv_bytes = batch_df.to_csv(index=False).encode()
+                    st.download_button("⬇️ Download batch predictions CSV", csv_bytes, file_name="batch_predictions.csv", mime="text/csv")
+            except Exception as e:
+                st.error(f"Could not process batch file: {e}")
 
-    data_for_viz = raw_df if raw_df is not None else X_train
+# -------------------------
+# Right: Analytics & explainers
+# -------------------------
+with right:
+    st.subheader("Quick Analytics")
+    st.markdown("Interactive charts provide fast insight into your dataset.")
 
-    if data_for_viz is None:
-        st.error("No dataset found for analytics.")
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if numeric_cols:
+        st.markdown("**Numeric distributions**")
+        for col in numeric_cols[:6]:
+            fig = px.histogram(df, x=col, nbins=40, title=col, marginal="box")
+            st.plotly_chart(fig, use_container_width=True)
     else:
-        st.subheader("Numeric Distributions")
-        num_cols = data_for_viz.select_dtypes(include=[np.number]).columns
+        st.info("No numeric columns found.")
 
-        for col in num_cols:
-            fig = px.histogram(data_for_viz, x=col, nbins=50, title=f"{col} Distribution")
+    cat_cols = df.select_dtypes(exclude=[np.number]).columns.tolist()
+    if cat_cols:
+        st.markdown("**Categorical counts (top 10)**")
+        for col in cat_cols[:6]:
+            vc = df[col].value_counts().nlargest(10).reset_index()
+            vc.columns = [col, "count"]
+            fig = px.bar(vc, x=col, y="count", title=col)
             st.plotly_chart(fig, use_container_width=True)
 
-        st.subheader("Categorical Counts")
-        cat_cols = data_for_viz.select_dtypes(exclude=[np.number]).columns
+    # Correlation
+    if len(numeric_cols) >= 2:
+        st.markdown("**Correlation matrix**")
+        corr = df[numeric_cols].corr()
+        fig_corr = px.imshow(corr, text_auto=True, title="Correlation")
+        st.plotly_chart(fig_corr, use_container_width=True)
 
-        for col in cat_cols:
-            fig = px.histogram(data_for_viz, x=col, title=f"{col} Counts")
-            st.plotly_chart(fig, use_container_width=True)
-
-# ---------------------------
-# ABOUT & SAVE
-# ---------------------------
-elif page == "About & Save":
-    st.header("ℹ About / Saved Predictions")
-
-    st.write("""
-    This app predicts Big Mart sales using a trained model (model.pkl).
-    The app attempts to recreate the original string→numeric mappings
-    by reading Train.csv (raw data) and X_data.pkl (if available).
-    """)
-
-    if os.path.exists("predictions_saved.csv"):
-        df = pd.read_csv("predictions_saved.csv")
-        st.success("Saved predictions found.")
-        st.dataframe(df)
-        st.download_button("Download saved predictions", df.to_csv(index=False).encode(), "predictions_saved.csv")
-    else:
-        st.info("No saved predictions available.")
-
-# ---------------------------
-# DEBUG
-# ---------------------------
-elif page == "Debug":
-    st.header("🐞 Debug / Internals")
-
-    st.subheader("Loaded files")
-    st.write({
-        "model_loaded": model is not None,
-        "X_train_loaded": X_train is not None,
-        "Train_csv_loaded": raw_df is not None
-    })
-
-    if X_train is not None:
-        st.subheader("X_train sample")
-        st.write(X_train.head())
-        st.write(X_train.dtypes)
-        st.write(list(X_train.columns))
-
-    if raw_df is not None:
-        st.subheader("Train.csv (raw) sample")
-        st.write(raw_df.head())
-        st.write(raw_df.dtypes)
-        st.write(list(raw_df.columns))
-
-    st.subheader("Mappings (sample)")
-    st.write({k: (dict(list(v.items())[:10])) for k, v in mappings.items()})
-
+# -------------------------
+# Footer / About
+# -------------------------
+st.markdown("---")
+with st.container():
+    c1, c2 = st.columns([3,1])
+    with c1:
+        st.markdown("**Notes:** This app **does not** persist saves to server. Use download buttons to export models or predictions. For persistent storage, connect S3/GDrive or a DB.")
+    with c2:
+        st.markdown(f'<small class="muted">Version • no-save</small>', unsafe_allow_html=True)
