@@ -17,7 +17,7 @@ ASSET_URL = "/mnt/data/logs-siddhantdotexe-sales-predict-main-app.py-2025-11-20T
 # ------------------------
 # Enhanced UI / Theme (unchanged)
 # ------------------------
-st.set_page_config(page_title="Big Mart Sales Predictor", page_icon="🛒", layout="wide")
+st.set_page_config(page_title="ML Based Revenue Evaluator", page_icon="🛒", layout="wide")
 
 # Modern color palette
 PRIMARY = "#0f766e"
@@ -383,7 +383,7 @@ with st.sidebar:
     if logo_path:
         st.image(logo_path, width=120)
     else:
-        st.markdown("### 🛒 Big Mart")
+        st.markdown("### 🛒 Sales")
         st.markdown('<p style="color: #64748b; font-size: 13px;">Sales Intelligence Platform</p>',
                     unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
@@ -415,7 +415,7 @@ with st.sidebar:
 col1, col2 = st.columns([4, 1])
 with col1:
     st.markdown('<div class="gradient-card">', unsafe_allow_html=True)
-    st.markdown('<h1 style="color: white; font-size: 42px; margin-bottom: 12px;">🛒 Big Mart Sales Predictor</h1>',
+    st.markdown('<h1 style="color: white; font-size: 42px; margin-bottom: 12px;">🛒 ML Based Revenue Evaluator</h1>',
                 unsafe_allow_html=True)
     st.markdown(
         '<p style="color: rgba(255,255,255,0.9); font-size: 16px; margin: 0;">Leverage AI-powered predictions to forecast sales performance with precision and confidence.</p>',
@@ -738,7 +738,7 @@ elif "ℹ️ About" in page:
     st.markdown("""
     <div class="info-box">
     <h4>🎯 Purpose</h4>
-    <p>This Big Mart Sales Predictor leverages advanced machine learning (XGBoost) to forecast 
+    <p>This Predictor leverages advanced machine learning (XGBoost) to forecast 
     product sales with high accuracy, helping retailers make data-driven inventory and pricing decisions.</p>
     </div>
     """, unsafe_allow_html=True)
