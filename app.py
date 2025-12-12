@@ -1,4 +1,4 @@
-# app.py - Universal Sales Predictor (CORRECTED VERSION)
+# app.py - Universal Sales Predictor (UPDATED: avoid CV deadlock / nested parallelism)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -17,7 +17,6 @@ import plotly.express as px
 # Optional XGBoost
 try:
     from xgboost import XGBRegressor
-
     XGBOOST_AVAILABLE = True
 except Exception:
     XGBOOST_AVAILABLE = False
@@ -44,14 +43,14 @@ def build_preprocessor(X_data, feature_cols):
     cat_cols = [c for c in feature_cols if c in X_data.columns and not pd.api.types.is_numeric_dtype(X_data[c])]
 
     transformers = []
-
+    
     if numeric_cols:
         numeric_transformer = Pipeline([
             ("imputer", SimpleImputer(strategy="mean")),
             ("scaler", StandardScaler())
         ])
         transformers.append(("num", numeric_transformer, numeric_cols))
-
+    
     if cat_cols:
         categorical_transformer = Pipeline([
             ("imputer", SimpleImputer(strategy="most_frequent")),
@@ -131,7 +130,7 @@ st.dataframe(df.head())
 
 # Choose target
 st.subheader("Choose target column (the column we will predict)")
-target_col = st.selectbox("Select target (numeric)", options=df.columns.tolist(),
+target_col = st.selectbox("Select target (numeric)", options=df.columns.tolist(), 
                           index=len(df.columns) - 1 if len(df.columns) > 0 else 0)
 
 # Validate target numeric
@@ -151,8 +150,7 @@ if not pd.api.types.is_numeric_dtype(df[target_col]):
 # Features selection
 st.subheader("Select feature columns (predictors)")
 default_features = [c for c in df.columns if c != target_col]
-feature_cols = st.multiselect("Features to use (choose one or more)", options=default_features,
-                              default=default_features)
+feature_cols = st.multiselect("Features to use (choose one or more)", options=default_features, default=default_features)
 
 if len(feature_cols) == 0:
     st.error("Pick at least one feature column.")
@@ -184,6 +182,7 @@ if model_choice.startswith("XGBoost") and not XGBOOST_AVAILABLE:
     st.warning("XGBoost not available in this environment; pick RandomForest or Ridge.")
 
 n_estimators = st.number_input("n_estimators (for tree models)", value=100, min_value=10, max_value=2000, step=10)
+use_multiple_cores_for_final_fit = st.checkbox("Use multiple cores for final fit (if available)", value=True)
 
 # ---------- Train button block ----------
 if st.button("Train model"):
@@ -199,16 +198,18 @@ if st.button("Train model"):
             # Build preprocessor based on TRAINING data only (prevent data leakage)
             preprocessor, num_cols, cat_cols = build_preprocessor(X_train, feature_cols)
 
-            # Build regressor
+            # Build regressor (final regressor - may use multiple cores for final fit)
             if "XGBoost" in model_choice and XGBOOST_AVAILABLE:
-                reg = XGBRegressor(n_estimators=int(n_estimators), verbosity=0, n_jobs=-1, random_state=42)
+                final_n_jobs = -1 if use_multiple_cores_for_final_fit else 1
+                reg_final = XGBRegressor(n_estimators=int(n_estimators), verbosity=0, n_jobs=final_n_jobs, random_state=42)
             elif "RandomForest" in model_choice:
-                reg = RandomForestRegressor(n_estimators=int(n_estimators), n_jobs=-1, random_state=42)
+                final_n_jobs = -1 if use_multiple_cores_for_final_fit else 1
+                reg_final = RandomForestRegressor(n_estimators=int(n_estimators), n_jobs=final_n_jobs, random_state=42)
             else:
-                reg = Ridge()
+                reg_final = Ridge()
 
-            # Full pipeline for actual model
-            pipeline = Pipeline([("preprocessor", preprocessor), ("regressor", reg)])
+            # Full pipeline for actual final model
+            pipeline = Pipeline([("preprocessor", preprocessor), ("regressor", reg_final)])
 
             # ---- 1) Cross-validation comparison with proper baseline ----
             st.subheader("📊 Cross-validation (5-fold) comparison")
@@ -221,43 +222,58 @@ if st.button("Train model"):
             ])
 
             try:
-                with st.spinner("Running cross-validation..."):
+                with st.spinner("Running cross-validation (single-threaded to avoid nested-parallel issues)..."):
+                    # NOTE: run CV single-threaded to avoid nested parallelism deadlocks
+                    cv_n_jobs = 1
+
                     # Baseline CV scores
                     baseline_rmse_cv = -cross_val_score(
                         baseline_pipeline, X_train, y_train,
-                        scoring="neg_root_mean_squared_error", cv=cv, n_jobs=-1
+                        scoring="neg_root_mean_squared_error", cv=cv, n_jobs=cv_n_jobs
                     )
                     baseline_r2_cv = cross_val_score(
                         baseline_pipeline, X_train, y_train,
-                        scoring="r2", cv=cv, n_jobs=-1
+                        scoring="r2", cv=cv, n_jobs=cv_n_jobs
                     )
 
-                    # Model CV scores
+                    # For CV make sure tree regressors use n_jobs=1 to avoid nested parallelism
+                    if isinstance(reg_final, RandomForestRegressor):
+                        reg_cv = RandomForestRegressor(n_estimators=int(n_estimators), n_jobs=1, random_state=42)
+                    elif XGBOOST_AVAILABLE and isinstance(reg_final, XGBRegressor):
+                        # create XGB for CV with single thread
+                        reg_cv = XGBRegressor(n_estimators=int(n_estimators), verbosity=0, n_jobs=1, random_state=42)
+                    elif isinstance(reg_final, Ridge):
+                        reg_cv = Ridge()
+                    else:
+                        reg_cv = reg_final
+
+                    pipeline_cv = Pipeline([("preprocessor", preprocessor), ("regressor", reg_cv)])
+
                     model_rmse_cv = -cross_val_score(
-                        pipeline, X_train, y_train,
-                        scoring="neg_root_mean_squared_error", cv=cv, n_jobs=-1
+                        pipeline_cv, X_train, y_train,
+                        scoring="neg_root_mean_squared_error", cv=cv, n_jobs=cv_n_jobs
                     )
                     model_r2_cv = cross_val_score(
-                        pipeline, X_train, y_train,
-                        scoring="r2", cv=cv, n_jobs=-1
+                        pipeline_cv, X_train, y_train,
+                        scoring="r2", cv=cv, n_jobs=cv_n_jobs
                     )
 
                     # Display comparison
                     col1, col2 = st.columns(2)
-
+                    
                     with col1:
                         st.markdown("**Baseline (Dummy Mean Predictor)**")
                         st.metric("RMSE", f"{baseline_rmse_cv.mean():.3f} ± {baseline_rmse_cv.std():.3f}")
                         st.metric("R²", f"{baseline_r2_cv.mean():.3f} ± {baseline_r2_cv.std():.3f}")
-
+                    
                     with col2:
                         st.markdown(f"**Your Model ({model_choice})**")
                         st.metric("RMSE", f"{model_rmse_cv.mean():.3f} ± {model_rmse_cv.std():.3f}",
-                                  delta=f"{baseline_rmse_cv.mean() - model_rmse_cv.mean():.3f}",
-                                  delta_color="normal")
+                                 delta=f"{baseline_rmse_cv.mean() - model_rmse_cv.mean():.3f}",
+                                 delta_color="normal")
                         st.metric("R²", f"{model_r2_cv.mean():.3f} ± {model_r2_cv.std():.3f}",
-                                  delta=f"{model_r2_cv.mean() - baseline_r2_cv.mean():.3f}",
-                                  delta_color="normal")
+                                 delta=f"{model_r2_cv.mean() - baseline_r2_cv.mean():.3f}",
+                                 delta_color="normal")
 
                     # Interpretation
                     if model_r2_cv.mean() > baseline_r2_cv.mean() + 0.01:
@@ -265,8 +281,7 @@ if st.button("Train model"):
                     elif model_r2_cv.mean() > baseline_r2_cv.mean():
                         st.info("ℹ️ Your model slightly outperforms the baseline.")
                     else:
-                        st.warning(
-                            "⚠️ Your model is not better than baseline. Consider feature engineering or different approach.")
+                        st.warning("⚠️ Your model is not better than baseline. Consider feature engineering or different approach.")
 
             except Exception as e:
                 st.warning(f"CV comparison could not be completed: {e}")
@@ -276,7 +291,7 @@ if st.button("Train model"):
             pipeline, stats = train_model(pipeline, X_train, y_train, X_val, y_val)
 
             st.success("Training complete!")
-
+            
             col1, col2, col3 = st.columns(3)
             col1.metric("Train R²", f"{stats['r2_train']:.4f}")
             col2.metric("Val R²", f"{stats['r2_val']:.4f}")
@@ -287,10 +302,10 @@ if st.button("Train model"):
                 try:
                     preds_val = stats["val_preds"]
                     resid = y_val.values - preds_val
-
-                    fig = px.scatter(x=preds_val, y=resid,
-                                     labels={"x": "Predicted", "y": "Residual"},
-                                     title="Residual Plot (Validation Set)")
+                    
+                    fig = px.scatter(x=preds_val, y=resid, 
+                                   labels={"x": "Predicted", "y": "Residual"}, 
+                                   title="Residual Plot (Validation Set)")
                     fig.add_hline(y=0, line_dash="dash", line_color="red")
                     st.plotly_chart(fig, use_container_width=True)
 
@@ -311,7 +326,6 @@ if st.button("Train model"):
         except Exception as e:
             st.error(f"Training failed: {e}")
             import traceback
-
             st.code(traceback.format_exc())
 # ---------------------------------------------------------------------------
 
@@ -320,11 +334,11 @@ if st.button("Train model"):
 if "pipeline" in st.session_state:
     pipeline = st.session_state["pipeline"]
     st.sidebar.success("Model ready ✅")
-
+    
     st.markdown("---")
     st.subheader("🔮 Make Prediction")
     st.markdown("Enter values for each feature:")
-
+    
     # Build form for single-row
     single_vals = {}
     cols_widgets = st.columns(3)
@@ -340,21 +354,21 @@ if "pipeline" in st.session_state:
             opts = df[feat].dropna().unique().tolist()
             if len(opts) > 0:
                 single_vals[feat] = cols_widgets[i % 3].selectbox(
-                    f"{feat}",
-                    options=opts,
-                    index=0,
+                    f"{feat}", 
+                    options=opts, 
+                    index=0, 
                     key=f"sv_{feat}"
                 )
             else:
                 single_vals[feat] = cols_widgets[i % 3].text_input(
-                    f"{feat}",
-                    value="",
+                    f"{feat}", 
+                    value="", 
                     key=f"sv_{feat}"
                 )
         else:
             single_vals[feat] = cols_widgets[i % 3].text_input(
-                f"{feat} (not in training data)",
-                value="",
+                f"{feat} (not in training data)", 
+                value="", 
                 key=f"sv_missing_{feat}"
             )
 
@@ -363,22 +377,23 @@ if "pipeline" in st.session_state:
             single_df = pd.DataFrame([single_vals])
             num_cols_stored = st.session_state.get("num_cols", [])
             single_df = sanitize_numeric(single_df, numeric_cols=num_cols_stored)
-
+            
             pred = pipeline.predict(single_df)[0]
             st.success(f"**Predicted {st.session_state['target_col']}: {pred:,.2f}**")
-
+            
             # Download option
             result_df = single_df.copy()
             result_df["Prediction"] = pred
             csv_data = result_df.to_csv(index=False).encode()
             st.download_button(
-                "Download prediction",
-                csv_data,
-                "single_prediction.csv",
+                "Download prediction", 
+                csv_data, 
+                "single_prediction.csv", 
                 "text/csv"
             )
         except Exception as e:
             st.error(f"Prediction failed: {e}")
+
 
 # Analytics section
 st.sidebar.markdown("---")
@@ -386,7 +401,7 @@ st.sidebar.subheader("Analytics")
 if st.sidebar.button("Show analytics"):
     st.markdown("---")
     st.header("📊 Automatic Analytics")
-
+    
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
 
     # Numeric distributions
@@ -401,7 +416,7 @@ if st.sidebar.button("Show analytics"):
             st.subheader("Correlation Matrix")
             corr = df[numeric_cols].corr()
             fig = px.imshow(corr, text_auto=".2f", title="Correlation matrix (numeric features)",
-                            color_continuous_scale="RdBu_r", zmin=-1, zmax=1)
+                          color_continuous_scale="RdBu_r", zmin=-1, zmax=1)
             st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("No numeric columns found for distribution analysis.")
@@ -433,8 +448,8 @@ if st.sidebar.button("Show analytics"):
                 ts = ts.dropna(subset=[chosen_date, target_col])
                 if not ts.empty:
                     ts_agg = ts.set_index(chosen_date).resample("W")[target_col].mean().reset_index()
-                    fig_ts = px.line(ts_agg, x=chosen_date, y=target_col,
-                                     title=f"Weekly average {target_col}")
+                    fig_ts = px.line(ts_agg, x=chosen_date, y=target_col, 
+                                    title=f"Weekly average {target_col}")
                     st.plotly_chart(fig_ts, use_container_width=True)
                 else:
                     st.info("No valid date/target data for time-series aggregation.")
