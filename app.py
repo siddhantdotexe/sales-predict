@@ -1,20 +1,19 @@
-# app.py - Universal Sales Predictor (categorical comparison & relationship analysis removed)
+# app.py - Universal Sales Predictor (prediction interval removed; only point prediction shown)
 import streamlit as st
 import pandas as pd
 import numpy as np
 import os
-import joblib
 from io import BytesIO
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, KFold, cross_val_score
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import Ridge
+from sklearn.dummy import DummyRegressor
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 import plotly.express as px
-import plotly.graph_objects as go
 
 # Optional XGBoost
 try:
@@ -25,10 +24,12 @@ except Exception:
 
 st.set_page_config(page_title="ML Based Revenue Predictor", layout="wide", page_icon="🛒")
 
+
 # -------------------------
 # Helper functions
 def rmse(y_true, y_pred):
     return np.sqrt(mean_squared_error(y_true, y_pred))
+
 
 def make_ohe():
     try:
@@ -36,9 +37,10 @@ def make_ohe():
     except TypeError:
         return OneHotEncoder(handle_unknown="ignore", sparse=False)
 
+
 def build_preprocessor(df, feature_cols):
-    numeric_cols = [c for c in feature_cols if pd.api.types.is_numeric_dtype(df[c])]
-    cat_cols = [c for c in feature_cols if not pd.api.types.is_numeric_dtype(df[c])]
+    numeric_cols = [c for c in feature_cols if c in df.columns and pd.api.types.is_numeric_dtype(df[c])]
+    cat_cols = [c for c in feature_cols if c in df.columns and not pd.api.types.is_numeric_dtype(df[c])]
 
     numeric_transformer = Pipeline([
         ("imputer", SimpleImputer(strategy="mean")),
@@ -57,6 +59,7 @@ def build_preprocessor(df, feature_cols):
 
     return preprocessor, numeric_cols, cat_cols
 
+
 def train_model(pipeline, X_train, y_train, X_val=None, y_val=None):
     pipeline.fit(X_train, y_train)
     train_preds = pipeline.predict(X_train)
@@ -74,8 +77,10 @@ def train_model(pipeline, X_train, y_train, X_val=None, y_val=None):
         })
     return pipeline, stats
 
+
 def download_link_fileobj(obj_bytes, filename, mime="text/csv"):
     return st.download_button(label=f"⬇️ Download {filename}", data=obj_bytes, file_name=filename, mime=mime)
+
 
 def sanitize_numeric(df, numeric_cols=None):
     df = df.copy()
@@ -86,6 +91,7 @@ def sanitize_numeric(df, numeric_cols=None):
             df[col] = df[col].astype(str).str.replace(r'[^\d\.\-eE]', '', regex=True)
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
+
 
 # -------------------------
 # UI Layout
@@ -100,9 +106,8 @@ use_sample = st.sidebar.checkbox("Use sample dataset (toy)", value=False)
 if use_sample:
     # generate a small sample if no file
     df = px.data.tips()  # small dataset; we'll adapt it to a 'sales' like example
-    # create a synthetic sales target from tips dataset
-    df = df.rename(columns={"total_bill":"Item_MRP", "tip":"Item_Outlet_Sales"})
-    df["Outlet_Type"] = np.random.choice(["Supermarket Type1","Grocery Store","Supermarket Type2"], size=len(df))
+    df = df.rename(columns={"total_bill": "Item_MRP", "tip": "Item_Outlet_Sales"})
+    df["Outlet_Type"] = np.random.choice(["Supermarket Type1", "Grocery Store", "Supermarket Type2"], size=len(df))
     st.sidebar.success("Loaded sample dataset (tips -> adapted).")
 elif uploaded_file is not None:
     try:
@@ -119,12 +124,11 @@ st.dataframe(df.head())
 
 # Choose target
 st.subheader("Choose target column (the column we will predict)")
-target_col = st.selectbox("Select target (numeric)", options=df.columns.tolist(), index=len(df.columns)-1 if len(df.columns)>0 else 0)
+target_col = st.selectbox("Select target (numeric)", options=df.columns.tolist(), index=len(df.columns) - 1 if len(df.columns) > 0 else 0)
 
 # Validate target numeric
 if not pd.api.types.is_numeric_dtype(df[target_col]):
     st.warning("Target column is not numeric. The app requires numeric target for regression. Please upload dataset with numeric sales column.")
-    # try to coerce
     try:
         df[target_col] = pd.to_numeric(df[target_col], errors="coerce")
         if df[target_col].isna().all():
@@ -160,7 +164,8 @@ if model_choice.startswith("XGBoost") and not XGBOOST_AVAILABLE:
 
 n_estimators = st.number_input("n_estimators (for tree models)", value=100, min_value=10, max_value=2000, step=10)
 
-# Train button
+
+# ---------- Train button block (baseline + CV; prediction interval removed) ----------
 if st.button("Train model"):
     with st.spinner("Building preprocessor and training model..."):
         # split
@@ -168,7 +173,7 @@ if st.button("Train model"):
         y = df[target_col]
         X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=test_size, random_state=42)
 
-        # build preprocessor
+        # build preprocessor (uses df to detect numeric vs categorical)
         preprocessor, num_cols, cat_cols = build_preprocessor(df, feature_cols)
 
         # build regressor
@@ -182,28 +187,63 @@ if st.button("Train model"):
         # full pipeline
         pipeline = Pipeline([("preprocessor", preprocessor), ("regressor", reg)])
 
-        # train
+        # ---- 1) Baseline & CV comparison ----
+        cv = KFold(n_splits=5, shuffle=True, random_state=42)
+        baseline = DummyRegressor(strategy="mean")
+
+        try:
+            baseline_rmse_cv = -cross_val_score(baseline, X, y,
+                                                scoring="neg_root_mean_squared_error", cv=cv, n_jobs=1)
+            baseline_r2_cv = cross_val_score(baseline, X, y, scoring="r2", cv=cv, n_jobs=1)
+
+            model_rmse_cv = -cross_val_score(pipeline, X, y,
+                                             scoring="neg_root_mean_squared_error", cv=cv, n_jobs=1)
+            model_r2_cv = cross_val_score(pipeline, X, y, scoring="r2", cv=cv, n_jobs=1)
+
+            st.subheader("Cross-validation (5-fold) comparison")
+            st.write(f"Baseline (Dummy mean) RMSE: {baseline_rmse_cv.mean():.3f} ± {baseline_rmse_cv.std():.3f}")
+            st.write(f"Baseline (Dummy mean) R²:   {baseline_r2_cv.mean():.3f} ± {baseline_r2_cv.std():.3f}")
+            st.write("---")
+            st.write(f"Model RMSE: {model_rmse_cv.mean():.3f} ± {model_rmse_cv.std():.3f}")
+            st.write(f"Model R²:   {model_r2_cv.mean():.3f} ± {model_r2_cv.std():.3f}")
+        except Exception as e:
+            st.warning(f"CV comparison could not be completed: {e}")
+
+        # ---- 2) Fit on train / eval on validation (keeps your existing logic) ----
         pipeline, stats = train_model(pipeline, X_train, y_train, X_val, y_val)
 
         st.success("Training complete!")
         st.metric("Train R²", f"{stats['r2_train']:.4f}")
         st.metric("Val R²", f"{stats['r2_val']:.4f}" if "r2_val" in stats else "N/A")
-        st.write(f"Train RMSE: {stats['rmse_train']:.4f} — Val RMSE: {stats.get('rmse_val','N/A'):.4f}" if "rmse_val" in stats else f"Train RMSE: {stats['rmse_train']:.4f}")
+        if "rmse_val" in stats:
+            st.write(f"Train RMSE: {stats['rmse_train']:.4f} — Val RMSE: {stats['rmse_val']:.4f}")
+        else:
+            st.write(f"Train RMSE: {stats['rmse_train']:.4f}")
 
-        # show residual plot for validation
+        # show residual plot for validation (no prediction-interval storage/display)
         if "r2_val" in stats:
-            preds_val = pipeline.predict(X_val)
-            resid = y_val - preds_val
-            fig = px.scatter(x=preds_val, y=resid, labels={"x":"Predicted", "y":"Residual"}, title="Residuals (val set)")
-            st.plotly_chart(fig, use_container_width=True)
+            try:
+                preds_val = pipeline.predict(X_val)
+                resid = y_val - preds_val
+                fig = px.scatter(x=preds_val, y=resid, labels={"x": "Predicted", "y": "Residual"}, title="Residuals (val set)")
+                st.plotly_chart(fig, use_container_width=True)
 
-        # store pipeline in session state
+                # show residual summary (mean/std) but DO NOT compute or store prediction intervals
+                resid_mean = np.mean(resid)
+                resid_std = np.std(resid, ddof=1)
+                st.write(f"Validation residuals: mean={resid_mean:.3f}, std={resid_std:.3f}")
+            except Exception as e:
+                st.info(f"Could not compute residuals: {e}")
+
+        # store pipeline and metadata in session state
         st.session_state["pipeline"] = pipeline
         st.session_state["feature_cols"] = feature_cols
         st.session_state["target_col"] = target_col
         st.session_state["model_stats"] = stats
         st.session_state["num_cols"] = num_cols
         st.session_state["cat_cols"] = cat_cols
+# ---------------------------------------------------------------------------
+
 
 # If a pipeline is present, show prediction UI
 if "pipeline" in st.session_state:
@@ -217,7 +257,11 @@ if "pipeline" in st.session_state:
     for i, feat in enumerate(st.session_state["feature_cols"]):
         # safe: widget based on dataset if column exists; otherwise text input
         if feat in df.columns and pd.api.types.is_numeric_dtype(df[feat]):
-            single_vals[feat] = cols_widgets[i % 3].number_input(f"{feat}", value=float(df[feat].dropna().median()) if not df[feat].dropna().empty else 0.0, key=f"sv_{feat}")
+            single_vals[feat] = cols_widgets[i % 3].number_input(
+                f"{feat}",
+                value=float(df[feat].dropna().median()) if not df[feat].dropna().empty else 0.0,
+                key=f"sv_{feat}"
+            )
         elif feat in df.columns:
             opts = df[feat].dropna().unique().tolist()
             if len(opts) > 0:
@@ -239,6 +283,7 @@ if "pipeline" in st.session_state:
 
         try:
             pred = pipeline.predict(single_df)[0]
+            # ONLY show point prediction (no prediction interval)
             st.success(f"Predicted {st.session_state['target_col']}: {pred:,.2f}")
             st.download_button("Download prediction", single_df.assign(Prediction=pred).to_csv(index=False).encode(), "single_prediction.csv", "text/csv")
         except Exception as e:
@@ -316,7 +361,6 @@ if st.sidebar.button("Show analytics"):
                     st.info("No valid date/target data for time-series aggregation.")
             except Exception as e:
                 st.info(f"Could not make time-series plot: {e}")
-
 
 # Save & load pipeline controls removed per request (no saving to disk in this version)
 st.sidebar.markdown("---")
